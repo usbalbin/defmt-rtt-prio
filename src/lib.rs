@@ -15,18 +15,10 @@
 //! use defmt_rtt_prio as _;
 //! ```
 //!
-//! # Blocking/Non-blocking
+//! # Blocking/Non-blocking and losing data
 //!
-//! `probe-rs` puts RTT into blocking-mode, to avoid losing data.
-//!
-//! As an effect this implementation may block forever if `probe-rs` disconnects
-//! at runtime. This is because the RTT buffer will fill up and writing will
-//! eventually halt the program execution.
-//!
-//! `defmt::flush` would also block forever in that case.
-//!
-//! If losing data is not a concern you can disable blocking mode by enabling
-//! the feature `disable-blocking-mode`
+//! This crate will never block if the buffer fills up. Instead the oldest data will be overwritten.
+//! If losing data is a problem then `defmt-rtt` might be a better option.
 //!
 #![no_std]
 
