@@ -4,6 +4,8 @@
 
 This is based on defmt-rtt from [knurling-rs/defmt](https://github.com/knurling-rs/defmt).However `defmt-rtt-prio` avoids any critical sections by exploiting the fact that interrupts of the same priority can not interrupt each other. We setup one RTT UP channel per NVIC priority level. By mapping each priority to its own RTT channel, we can guarantee that there will be no problems.
 
+NOTE this crate currently only works with Cortex-M devices
+
 NOTE when using this crate it's not possible to use (link to) the
 `defmt-rtt` or `rtt-target` crates
 
