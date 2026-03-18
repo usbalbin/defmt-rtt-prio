@@ -13,10 +13,16 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rust:
-          - stable
-        target:
-          - thumbv7em-none-eabihf
+        include:
+          - rust: stable
+            target: thumbv6m-none-eabi
+            features: prio_bits_2
+          - rust: stable
+            target: thumbv7em-none-eabihf
+            features: prio_bits_4
+          - rust: stable
+            target: thumbv8m.main-none-eabihf
+            features: prio_bits_4
 
     steps:
       - uses: actions/checkout@v2
@@ -30,6 +36,6 @@ jobs:
       - name: Format
         run: cargo fmt
       - name: Regular build
-        run: cargo check --target ${{ matrix.target }}
+        run: cargo check --target ${{ matrix.target }} --features ${{ matrix.features }}
       - name: Clippy
-        run: cargo clippy --target ${{ matrix.target }}
+        run: cargo clippy --target ${{ matrix.target }} --features ${{ matrix.features }}
