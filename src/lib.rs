@@ -1,13 +1,18 @@
-//! [`defmt`](https://github.com/knurling-rs/defmt) global logger over RTT.
+//! [`defmt-rtt-prio`](https://github.com/usbalbin/defmt-rtt-prio) global lock free logger over RTT.
+//!
+//! This is based on defmt-rtt from [knurling-rs/defmt](https://github.com/knurling-rs/defmt). However
+//! `defmt-rtt-prio` avoids any critical sections by exploiting the fact that interrupts of the same
+//! priority can not interrupt each other. We setup one RTT UP channel per NVIC priority level. By
+//! mapping each priority to its own RTT channel, we can guarantee that there will be no problems.
 //!
 //! NOTE when using this crate it's not possible to use (link to) the
-//! `rtt-target` crate
+//! `defmt-rtt` or `rtt-target` crates
 //!
 //! To use this crate, link to it by importing it somewhere in your project.
 //!
 //! ```
 //! // src/main.rs or src/bin/my-app.rs
-//! use defmt_rtt as _;
+//! use defmt_rtt_prio as _;
 //! ```
 //!
 //! # Blocking/Non-blocking
@@ -20,36 +25,24 @@
 //!
 //! `defmt::flush` would also block forever in that case.
 //!
-//! If losing data is not an concern you can disable blocking mode by enabling
+//! If losing data is not a concern you can disable blocking mode by enabling
 //! the feature `disable-blocking-mode`
 //!
-//! # Critical section implementation
-//!
-//! This crate uses
-//! [`critical-section`](https://github.com/rust-embedded/critical-section) to
-//! ensure only one thread is writing to the buffer at a time. You must import a
-//! crate that provides a `critical-section` implementation suitable for the
-//! current target. See the `critical-section` README for details.
-//!
-//! For example, for single-core privileged-mode Cortex-M targets, you can add
-//! the following to your Cargo.toml.
-//!
-//! ```toml
-//! [dependencies]
-//! cortex-m = { version = "0.7.6", features = ["critical-section-single-core"]}
-//! ```
-
 #![no_std]
 
 mod channel;
 mod consts;
 
 use core::{
+    arch::asm,
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{channel::Channel, consts::BUF_SIZE};
+use crate::{
+    channel::Channel,
+    consts::{BUF_SIZE, UP_CHANNELS},
+};
 
 /// The relevant bits in the mode field in the Header
 const MODE_MASK: u32 = 0b11;
@@ -81,19 +74,26 @@ static RTT_ENCODER: RttEncoder = RttEncoder::new();
 #[no_mangle]
 static _SEGGER_RTT: Header = Header {
     id: *b"SEGGER RTT\0\0\0\0\0\0",
-    max_up_channels: 1,
+    max_up_channels: UP_CHANNELS as u32,
     max_down_channels: 0,
-    up_channel: Channel {
-        name: NAME.as_ptr(),
-        buffer: BUFFER.get(),
-        size: BUF_SIZE as u32,
-        write: AtomicU32::new(0),
-        read: AtomicU32::new(0),
-        flags: AtomicU32::new(MODE_NON_BLOCKING_TRIM),
+    up_channels: {
+        let mut chs = [const { Channel::zero() }; UP_CHANNELS];
+
+        let mut i = 0;
+        while i < UP_CHANNELS {
+            chs[i].name = NAME.as_ptr();
+            chs[i].buffer = BUFFERS[i].get();
+            chs[i].size = BUF_SIZE as u32;
+            chs[i].write = AtomicU32::new(0);
+            chs[i].read = AtomicU32::new(0);
+            chs[i].flags = AtomicU32::new(MODE_NON_BLOCKING_TRIM);
+            i += 1;
+        }
+        chs
     },
 };
 
-/// Report whether the SEGGER RTT up channel is in blocking mode.
+/// Report whether the first SEGGER RTT up channel is in blocking mode.
 ///
 /// Returns true if the mode bitfield within the flags value has been set to
 /// `SEGGER_RTT_MODE_BLOCK_IF_FIFO_FULL`.
@@ -101,13 +101,13 @@ static _SEGGER_RTT: Header = Header {
 /// Currently we start-up in non-blocking mode, so if it's been set to blocking
 /// mode then the connected client (e.g. probe-rs) must have done it.
 pub fn in_blocking_mode() -> bool {
-    (_SEGGER_RTT.up_channel.flags.load(Ordering::Relaxed) & MODE_MASK) == MODE_BLOCK_IF_FULL
+    (_SEGGER_RTT.up_channels[0].flags.load(Ordering::Relaxed) & MODE_MASK) == MODE_BLOCK_IF_FULL
 }
 
 /// Our shared buffer
 #[cfg_attr(target_os = "macos", link_section = ".uninit,defmt-rtt.BUFFER")]
 #[cfg_attr(not(target_os = "macos"), link_section = ".uninit.defmt-rtt.BUFFER")]
-static BUFFER: Buffer = Buffer::new();
+static BUFFERS: [Buffer; UP_CHANNELS] = [const { Buffer::new() }; UP_CHANNELS];
 
 /// The name of our channel.
 ///
@@ -118,48 +118,30 @@ static BUFFER: Buffer = Buffer::new();
 static NAME: [u8; 6] = *b"defmt\0";
 
 struct RttEncoder {
-    /// A boolean lock
-    ///
-    /// Is `true` when `acquire` has been called and we have exclusive access to
-    /// the rest of this structure.
-    taken: AtomicBool,
-    /// We need to remember this to exit a critical section
-    cs_restore: UnsafeCell<critical_section::RestoreState>,
     /// A defmt::Encoder for encoding frames
-    encoder: UnsafeCell<defmt::Encoder>,
+    encoders: [UnsafeCell<defmt::Encoder>; UP_CHANNELS],
 }
 
 impl RttEncoder {
     /// Create a new semihosting-based defmt-encoder
     const fn new() -> RttEncoder {
         RttEncoder {
-            taken: AtomicBool::new(false),
-            cs_restore: UnsafeCell::new(critical_section::RestoreState::invalid()),
-            encoder: UnsafeCell::new(defmt::Encoder::new()),
+            encoders: [const { UnsafeCell::new(defmt::Encoder::new()) }; UP_CHANNELS],
         }
     }
 
     /// Acquire the defmt encoder.
     fn acquire(&self) {
-        // safety: Must be paired with corresponding call to release(), see below
-        let restore = unsafe { critical_section::acquire() };
-
-        // NB: You can re-enter critical sections but we need to make sure
-        // no-one does that.
-        if self.taken.load(Ordering::Relaxed) {
-            panic!("defmt logger taken reentrantly")
+        let prio = get_priority() as usize;
+        if prio >= UP_CHANNELS {
+            return;
         }
-
-        // no need for CAS because we are in a critical section
-        self.taken.store(true, Ordering::Relaxed);
-
-        // safety: accessing the cell is OK because we have acquired a critical
-        // section.
+        // safety: accessing the cell is OK because we are the only one running at this prio
+        // and using this channel
         unsafe {
-            self.cs_restore.get().write(restore);
-            let encoder: &mut defmt::Encoder = &mut *self.encoder.get();
+            let encoder: &mut defmt::Encoder = &mut *self.encoders[prio].get();
             encoder.start_frame(|b| {
-                _SEGGER_RTT.up_channel.write_all(b);
+                _SEGGER_RTT.up_channels[prio].write_all(b);
             });
         }
     }
@@ -170,12 +152,16 @@ impl RttEncoder {
     ///
     /// Do not call unless you have called `acquire`.
     unsafe fn write(&self, bytes: &[u8]) {
-        // safety: accessing the cell is OK because we have acquired a critical
-        // section.
+        let prio = get_priority() as usize;
+        if prio >= UP_CHANNELS {
+            return;
+        }
+        // safety: accessing the cell is OK because we are the only one running at this prio
+        // and using this channel
         unsafe {
-            let encoder: &mut defmt::Encoder = &mut *self.encoder.get();
+            let encoder: &mut defmt::Encoder = &mut *self.encoders[prio].get();
             encoder.write(bytes, |b| {
-                _SEGGER_RTT.up_channel.write_all(b);
+                _SEGGER_RTT.up_channels[prio].write_all(b);
             });
         }
     }
@@ -186,9 +172,13 @@ impl RttEncoder {
     ///
     /// Do not call unless you have called `acquire`.
     unsafe fn flush(&self) {
-        // safety: accessing the `&'static _` is OK because we have acquired a
-        // critical section.
-        _SEGGER_RTT.up_channel.flush();
+        let prio = get_priority() as usize;
+        if prio >= UP_CHANNELS {
+            return;
+        }
+        // safety: accessing the cell is OK because we are the only one running at this prio
+        // and using this channel
+        _SEGGER_RTT.up_channels[prio].flush();
     }
 
     /// Release the defmt encoder.
@@ -199,21 +189,59 @@ impl RttEncoder {
     /// your lock - do not call `flush` and `write` until you have done another
     /// `acquire`.
     unsafe fn release(&self) {
-        if !self.taken.load(Ordering::Relaxed) {
-            panic!("defmt release out of context")
+        let prio = get_priority() as usize;
+        if prio >= UP_CHANNELS {
+            return;
         }
-
-        // safety: accessing the cell is OK because we have acquired a critical
-        // section.
+        // safety: accessing the cell is OK because we are the only one running at this prio
+        // and using this channel
         unsafe {
-            let encoder: &mut defmt::Encoder = &mut *self.encoder.get();
+            let encoder: &mut defmt::Encoder = &mut *self.encoders[prio].get();
             encoder.end_frame(|b| {
-                _SEGGER_RTT.up_channel.write_all(b);
+                _SEGGER_RTT.up_channels[prio].write_all(b);
             });
-            let restore = self.cs_restore.get().read();
-            self.taken.store(false, Ordering::Relaxed);
-            // paired with exactly one acquire call
-            critical_section::release(restore);
+        }
+    }
+}
+
+// See https://github.com/rtic-rs/rtic/pull/495#issuecomment-929332903
+pub fn get_priority() -> u8 {
+    use cortex_m::peripheral::scb::{Exception, SystemHandler, VectActive};
+    use cortex_m::peripheral::{NVIC, SCB};
+
+    #[derive(Copy, Clone)]
+    struct InterruptNumber(u8);
+    unsafe impl cortex_m::interrupt::InterruptNumber for InterruptNumber {
+        fn number(self) -> u16 {
+            self.0 as u16
+        }
+    }
+
+    let ipsr: u32;
+    unsafe {
+        asm!("mrs {}, IPSR", out(reg) ipsr);
+    }
+
+    let vect_active = VectActive::from(ipsr as u8).unwrap_or(VectActive::ThreadMode);
+
+    match vect_active {
+        VectActive::ThreadMode => 0,
+        VectActive::Exception(ex) => {
+            let sysh = match ex {
+                Exception::MemoryManagement => SystemHandler::MemoryManagement,
+                Exception::BusFault => SystemHandler::BusFault,
+                Exception::UsageFault => SystemHandler::UsageFault,
+                Exception::SVCall => SystemHandler::SVCall,
+                Exception::DebugMonitor => SystemHandler::DebugMonitor,
+                Exception::PendSV => SystemHandler::PendSV,
+                Exception::SysTick => SystemHandler::SysTick,
+                Exception::HardFault => return 16,
+                Exception::NonMaskableInt => return UP_CHANNELS as u8, // sentinel: skip logging
+            };
+            16 - (SCB::get_priority(sysh) >> 4)
+        }
+        VectActive::Interrupt { irqn } => {
+            16 - (NVIC::get_priority(InterruptNumber(irqn - 16)) >> 4)
         }
     }
 }
@@ -249,7 +277,7 @@ struct Header {
     id: [u8; 16],
     max_up_channels: u32,
     max_down_channels: u32,
-    up_channel: Channel,
+    up_channels: [Channel; UP_CHANNELS],
 }
 
 unsafe impl Sync for Header {}

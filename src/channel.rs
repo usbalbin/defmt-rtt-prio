@@ -25,14 +25,21 @@ pub(crate) struct Channel {
 }
 
 impl Channel {
+    pub const fn zero() -> Self {
+        Self {
+            name: ptr::null(),
+            buffer: ptr::null_mut(),
+            size: 0,
+            write: AtomicU32::new(0),
+            read: AtomicU32::new(0),
+            flags: AtomicU32::new(0),
+        }
+    }
+
     pub fn write_all(&self, mut bytes: &[u8]) {
         // the host-connection-status is only modified after RAM initialization while the device is
         // halted, so we only need to check it once before the write-loop
-        let write = match self.host_is_connected() {
-            _ if cfg!(feature = "disable-blocking-mode") => Self::nonblocking_write,
-            true => Self::blocking_write,
-            false => Self::nonblocking_write,
-        };
+        let write = Self::nonblocking_write;
 
         while !bytes.is_empty() {
             let consumed = write(self, bytes);
@@ -40,24 +47,6 @@ impl Channel {
                 bytes = &bytes[consumed..];
             }
         }
-    }
-
-    fn blocking_write(&self, bytes: &[u8]) -> usize {
-        if bytes.is_empty() {
-            return 0;
-        }
-
-        // calculate how much space is left in the buffer
-        let read = self.read.load(Ordering::Relaxed) as usize;
-        let write = self.write.load(Ordering::Acquire) as usize;
-        let available = available_buffer_size(read, write);
-
-        // abort if buffer is full
-        if available == 0 {
-            return 0;
-        }
-
-        self.write_impl(bytes, write, available)
     }
 
     fn nonblocking_write(&self, bytes: &[u8]) -> usize {
@@ -108,15 +97,6 @@ impl Channel {
     fn host_is_connected(&self) -> bool {
         // we assume that a host is connected if we are in blocking-mode. this is what probe-run does.
         self.flags.load(Ordering::Relaxed) & MODE_MASK == MODE_BLOCK_IF_FULL
-    }
-}
-
-/// How much space is left in the buffer?
-fn available_buffer_size(read_cursor: usize, write_cursor: usize) -> usize {
-    if read_cursor > write_cursor {
-        read_cursor - write_cursor - 1
-    } else {
-        BUF_SIZE - write_cursor - 1 + read_cursor
     }
 }
 
