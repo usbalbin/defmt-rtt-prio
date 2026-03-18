@@ -11,6 +11,14 @@ repository = "https://github.com/usbalbin/defmt-rtt-prio"
 version = "0.1.0"
 
 [features]
+prio_bits_2 = []
+prio_bits_3 = []
+prio_bits_4 = []
+prio_bits_5 = []
+prio_bits_6 = []
+prio_bits_7 = []
+prio_bits_8 = []
+
 
 [dependencies]
 defmt = { version = "1" }

@@ -22,6 +22,75 @@
 //!
 #![no_std]
 
+#[cfg(not(any(
+    feature = "prio_bits_2",
+    feature = "prio_bits_3",
+    feature = "prio_bits_4",
+    feature = "prio_bits_5",
+    feature = "prio_bits_6",
+    feature = "prio_bits_7",
+    feature = "prio_bits_8"
+)))]
+compile_error!(
+    "Please select number of interrupt priority bits using one of the `prio_bits_X` features:
+* `prio_bits_2`
+* `prio_bits_3`
+* `prio_bits_4`
+* `prio_bits_5`
+* `prio_bits_6`
+* `prio_bits_7`
+* `prio_bits_8`
+"
+);
+
+// Ensure exactly one prio_bits feature is selected
+#[cfg(any(
+    all(
+        feature = "prio_bits_2",
+        any(
+            feature = "prio_bits_3",
+            feature = "prio_bits_4",
+            feature = "prio_bits_5",
+            feature = "prio_bits_6",
+            feature = "prio_bits_7",
+            feature = "prio_bits_8"
+        )
+    ),
+    all(
+        feature = "prio_bits_3",
+        any(
+            feature = "prio_bits_4",
+            feature = "prio_bits_5",
+            feature = "prio_bits_6",
+            feature = "prio_bits_7",
+            feature = "prio_bits_8"
+        )
+    ),
+    all(
+        feature = "prio_bits_4",
+        any(
+            feature = "prio_bits_5",
+            feature = "prio_bits_6",
+            feature = "prio_bits_7",
+            feature = "prio_bits_8"
+        )
+    ),
+    all(
+        feature = "prio_bits_5",
+        any(
+            feature = "prio_bits_6",
+            feature = "prio_bits_7",
+            feature = "prio_bits_8"
+        )
+    ),
+    all(
+        feature = "prio_bits_6",
+        any(feature = "prio_bits_7", feature = "prio_bits_8")
+    ),
+    all(feature = "prio_bits_7", feature = "prio_bits_8"),
+))]
+compile_error!("Only one `prio_bits_X` feature may be enabled at a time");
+
 mod channel;
 mod consts;
 
@@ -33,7 +102,7 @@ use core::{
 
 use crate::{
     channel::Channel,
-    consts::{BUF_SIZE, UP_CHANNELS},
+    consts::{BUF_SIZE, PRIO_BITS, UP_CHANNELS},
 };
 
 /// The relevant bits in the mode field in the Header
@@ -197,7 +266,15 @@ impl RttEncoder {
 }
 
 // See https://github.com/rtic-rs/rtic/pull/495#issuecomment-929332903
-pub fn get_priority() -> u8 {
+/// `0`: Thread context
+/// `1`: Interrupt with priority 0 aka least urgent
+/// `2`: Interrupt with priority 1
+/// ...
+/// ...
+/// `UP_CHANNELS - 2`: Interrupt with priority `UP_CHANNELS - 3` aka most urgent
+/// `UP_CHANNELS - 1`: Hardfault
+/// `UP_CHANNELS`: Non maskable interrupt
+pub(crate) fn get_priority() -> u8 {
     use cortex_m::peripheral::scb::{Exception, SystemHandler, VectActive};
     use cortex_m::peripheral::{NVIC, SCB};
 
@@ -215,26 +292,41 @@ pub fn get_priority() -> u8 {
     }
 
     let vect_active = VectActive::from(ipsr as u8).unwrap_or(VectActive::ThreadMode);
+    let prio_count = 1 << PRIO_BITS;
 
-    match vect_active {
+    let prio = match vect_active {
         VectActive::ThreadMode => 0,
         VectActive::Exception(ex) => {
             let sysh = match ex {
+                #[cfg(not(armv6m))]
                 Exception::MemoryManagement => SystemHandler::MemoryManagement,
+                #[cfg(not(armv6m))]
                 Exception::BusFault => SystemHandler::BusFault,
+                #[cfg(not(armv6m))]
                 Exception::UsageFault => SystemHandler::UsageFault,
+                #[cfg(any(armv8m, native))]
+                Exception::SecureFault => SystemHandler::SecureFault,
                 Exception::SVCall => SystemHandler::SVCall,
+                #[cfg(not(armv6m))]
                 Exception::DebugMonitor => SystemHandler::DebugMonitor,
                 Exception::PendSV => SystemHandler::PendSV,
                 Exception::SysTick => SystemHandler::SysTick,
-                Exception::HardFault => return 16,
+                Exception::HardFault => return UP_CHANNELS as u8 - 1,
                 Exception::NonMaskableInt => return UP_CHANNELS as u8, // sentinel: skip logging
             };
-            16 - (SCB::get_priority(sysh) >> 4)
+            prio_count - (SCB::get_priority(sysh) >> (8 - PRIO_BITS))
         }
         VectActive::Interrupt { irqn } => {
-            16 - (NVIC::get_priority(InterruptNumber(irqn - 16)) >> 4)
+            prio_count - (NVIC::get_priority(InterruptNumber(irqn - 16)) >> (8 - PRIO_BITS))
         }
+    };
+
+    if prio < UP_CHANNELS as u8 - 1 {
+        prio
+    } else {
+        // TODO: Now we disable for the most urgent interrupts if UP_CHANNELS < prio_count + 2
+        // does that make sense?
+        UP_CHANNELS as u8 // sentinel: skip logging
     }
 }
 
